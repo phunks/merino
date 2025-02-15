@@ -1,0 +1,8 @@
+services:
+  emulator:
+    image: tonistiigi/binfmt
+    container_name: emulator
+    privileged: true
+    command: --install all
+    network_mode: bridge
+    restart: no

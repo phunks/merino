@@ -1,13 +1,12 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), deny(warnings))]
-#![warn(clippy::all, rust_2018_idioms)]
+#![warn(rust_2018_idioms)]
 #[macro_use]
 extern crate log;
 
-use clap::{ArgGroup, Parser};
+use clap::{ArgAction, Parser};
 use merino::*;
-use std::env;
-use std::error::Error;
+use std::{env, error::Error};
 use std::os::unix::prelude::MetadataExt;
 use std::path::PathBuf;
 
@@ -23,43 +22,39 @@ const LOGO: &str = r"
 ";
 
 #[derive(Parser, Debug)]
-#[clap(version)]
-#[clap(group(
-    ArgGroup::new("auth")
-        .required(true)
-        .args(&["no-auth", "users"]),
-), group(
-    ArgGroup::new("log")
-        .args(&["verbosity", "quiet"]),
-))]
-struct Opt {
-    #[clap(short, long, default_value_t = 1080)]
+#[command(version)]
+pub struct Opt {
+    #[arg(short, long, default_value_t = 1080)]
     /// Set port to listen on
     port: u16,
 
-    #[clap(short, long, default_value = "127.0.0.1")]
+    #[arg(short, long, default_value = "127.0.0.1")]
     /// Set ip to listen on
     ip: String,
 
-    #[clap(long)]
+    #[arg(long)]
     /// Allow insecure configuration
     allow_insecure: bool,
 
-    #[clap(long)]
+    #[arg(long, group = "auth")]
     /// Allow unauthenticated connections
     no_auth: bool,
 
-    #[clap(short, long)]
+    #[arg(short, long, group = "auth")]
     /// CSV File with username/password pairs
     users: Option<PathBuf>,
 
+    #[arg(short, long)]
+    /// Dns filter list
+    filter: Option<PathBuf>,
+
     /// Log verbosity level. -vv for more verbosity.
     /// Environmental variable `RUST_LOG` overrides this flag!
-    #[clap(short, parse(from_occurrences))]
+    #[arg(short, group = "log", action = ArgAction::Count)]
     verbosity: u8,
 
     /// Do not output any logs (even errors!). Overrides `RUST_LOG`
-    #[clap(short)]
+    #[arg(short, group = "log")]
     quiet: bool,
 }
 
@@ -155,7 +150,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let authed_users = authed_users?;
 
     // Create proxy server
-    let mut merino = Merino::new(opt.port, &opt.ip, auth_methods, authed_users, None).await?;
+    let mut merino: merino::Merino = Merino::new(
+        opt.port,
+        &opt.ip,
+        opt.filter,
+        auth_methods,
+        authed_users,
+        None,
+    )
+    .await?;
 
     // Start Proxies
     merino.serve().await;

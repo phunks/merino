@@ -1,0 +1,22 @@
+services:
+  merino:
+    build:
+      context: .
+      dockerfile: Dockerfile_musl
+    init: true
+    environment:
+      TZ: Asia/Tokyo
+    container_name: "merino"
+    ports:
+      - "${BIND_IP}:1080:1080"
+    networks:
+      - net
+    restart: always
+
+networks:
+  net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.24.10.0/24

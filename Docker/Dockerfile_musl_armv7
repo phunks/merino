@@ -1,0 +1,7 @@
+FROM gcr.io/distroless/static-debian12:nonroot
+WORKDIR /app
+USER nonroot
+COPY --chown=nonroot:nonroot ./target/armv7-unknown-linux-musleabi/release/merino /app/
+COPY --chown=nonroot:nonroot ./filter_list.txt /app/
+EXPOSE 1080/tcp
+ENTRYPOINT ["/app/merino", "--no-auth", "--ip", "0.0.0.0", "--filter", "/app/filter_list.txt"]

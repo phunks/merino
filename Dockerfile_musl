@@ -1,0 +1,14 @@
+FROM rust:latest AS build-env
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL="sparse"
+WORKDIR /app
+COPY Cargo.toml filter_list.txt /app/
+COPY src /app/src
+RUN rustup target add $(uname -m)-unknown-linux-musl
+RUN cargo build --release --target $(uname -m)-unknown-linux-musl
+RUN strip /app/target/$(uname -m)-unknown-linux-musl/release/merino -o /app/merino
+
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /app
+USER nonroot
+COPY --chown=nonroor:nonroot --from=build-env /app/merino /app/filter_list.txt /app/
+ENTRYPOINT ["/app/merino", "--no-auth", "--ip", "0.0.0.0", "--filter", "/app/filter_list.txt"]

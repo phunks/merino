@@ -3,16 +3,21 @@
 extern crate serde_derive;
 #[macro_use]
 extern crate log;
-use snafu::Snafu;
 
-use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::Arc;
-use std::time::Duration;
+mod monitor;
+use crate::monitor::{monitor, FilterList};
+use snafu::Snafu;
+use std::{io,
+          net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+          path::PathBuf,
+          sync::Arc,
+          time::Duration,
+          vec};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, lookup_host};
-use tokio::time::timeout;
+use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+            net::{lookup_host, TcpListener, TcpStream},
+            time::timeout,
+            sync::Mutex};
 
 /// Version of socks
 const SOCKS_VERSION: u8 = 0x05;
@@ -170,6 +175,7 @@ enum SockCommand {
     Connect = 0x01,
     Bind = 0x02,
     UdpAssosiate = 0x3,
+    Drop         = 0xff,
 }
 
 impl SockCommand {
@@ -198,6 +204,7 @@ pub enum AuthMethods {
 pub struct Merino {
     listener: TcpListener,
     users: Arc<Vec<User>>,
+    filter: Arc<Mutex<FilterList>>,
     auth_methods: Arc<Vec<u8>>,
     // Timeout for connections
     timeout: Option<Duration>,
@@ -208,15 +215,24 @@ impl Merino {
     pub async fn new(
         port: u16,
         ip: &str,
+        file: Option<PathBuf>,
         auth_methods: Vec<u8>,
         users: Vec<User>,
         timeout: Option<Duration>,
     ) -> io::Result<Self> {
         info!("Listening on {}:{}", ip, port);
+        let filter = Arc::new(Mutex::new(FilterList::new(file.clone())));
+        let filter_clone = Arc::clone(&filter);
+
+        tokio::spawn(async move {
+            monitor(&file, filter_clone).await.unwrap();
+        });
+
         Ok(Merino {
             listener: TcpListener::bind((ip, port)).await?,
             auth_methods: Arc::new(auth_methods),
             users: Arc::new(users),
+            filter,
             timeout,
         })
     }
@@ -226,9 +242,10 @@ impl Merino {
         while let Ok((stream, client_addr)) = self.listener.accept().await {
             let users = self.users.clone();
             let auth_methods = self.auth_methods.clone();
-            let timeout = self.timeout.clone();
+            let timeout = self.timeout;
+            let filter_list = self.filter.clone();
             tokio::spawn(async move {
-                let mut client = SOCKClient::new(stream, users, auth_methods, timeout);
+                let mut client = SOCKClient::new(stream, users, filter_list, auth_methods, timeout);
                 match client.init().await {
                     Ok(_) => {}
                     Err(error) => {
@@ -254,6 +271,7 @@ pub struct SOCKClient<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> {
     auth_nmethods: u8,
     auth_methods: Arc<Vec<u8>>,
     authed_users: Arc<Vec<User>>,
+    filter_list: Arc<Mutex<FilterList>>,
     socks_version: u8,
     timeout: Option<Duration>,
 }
@@ -266,6 +284,7 @@ where
     pub fn new(
         stream: T,
         authed_users: Arc<Vec<User>>,
+        filter_list: Arc<Mutex<FilterList>>,
         auth_methods: Arc<Vec<u8>>,
         timeout: Option<Duration>,
     ) -> Self {
@@ -274,6 +293,7 @@ where
             auth_nmethods: 0,
             socks_version: 0,
             authed_users,
+            filter_list,
             auth_methods,
             timeout,
         }
@@ -283,6 +303,7 @@ where
     pub fn new_no_auth(stream: T, timeout: Option<Duration>) -> Self {
         // FIXME: use option here
         let authed_users: Arc<Vec<User>> = Arc::new(Vec::new());
+        let filter_list: Arc<Mutex<FilterList>> = Arc::new(Mutex::new(FilterList::new(None)));
         let mut no_auth: Vec<u8> = Vec::new();
         no_auth.push(AuthMethods::NoAuth as u8);
         let auth_methods: Arc<Vec<u8>> = Arc::new(no_auth);
@@ -292,6 +313,7 @@ where
             auth_nmethods: 0,
             socks_version: 0,
             authed_users,
+            filter_list,
             auth_methods,
             timeout,
         }
@@ -336,6 +358,12 @@ where
                 self.handle_client().await?;
             }
             _ => {
+                let req = SOCKSReq::from_stream(&mut self.stream).await?;
+                let displayed_addr = pretty_print_addr(&req.addr_type, &req.addr);
+                warn!(
+                    "New Request: Command: {:?} Addr: {}, Port: {}",
+                    req.command, displayed_addr, req.port
+                );
                 warn!("Init: Unsupported version: SOCKS{}", self.socks_version);
                 self.shutdown().await?;
             }
@@ -424,9 +452,9 @@ where
     pub async fn handle_client(&mut self) -> Result<usize, MerinoError> {
         debug!("Starting to relay data");
 
-        let req = SOCKSReq::from_stream(&mut self.stream).await?;
+        let mut req = SOCKSReq::from_stream(&mut self.stream).await?;
 
-        if req.addr_type == AddrType::V6 {}
+        // if req.addr_type == AddrType::V6 {}
 
         // Log Request
         let displayed_addr = pretty_print_addr(&req.addr_type, &req.addr);
@@ -434,6 +462,16 @@ where
             "New Request: Command: {:?} Addr: {}, Port: {}",
             req.command, displayed_addr, req.port
         );
+
+        if !IntoIterator::into_iter(&self.filter_list.lock().await.filter)
+            .any(|x| match req.addr_type {
+                AddrType::V4 => &req.addr == x,
+                AddrType::Domain => req.addr.ends_with(x.as_ref()),
+                AddrType::V6 => true,
+            })
+        {
+            req.command = SockCommand::Drop;
+        }
 
         // Respond
         match req.command {
@@ -472,7 +510,10 @@ where
                         trace!("already closed");
                         Ok(0)
                     }
-                    Err(e) => Err(MerinoError::Io(e)),
+                    Err(e) => Err(MerinoError::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        format!("{} {}:{}", e, displayed_addr, req.port),
+                    ))),
                     Ok((_s_to_t, t_to_s)) => Ok(t_to_s as usize),
                 }
             }
@@ -483,6 +524,13 @@ where
             SockCommand::UdpAssosiate => Err(MerinoError::Io(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "UdpAssosiate not supported",
+            ))),
+            SockCommand::Drop => Err(MerinoError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} {}:{}",
+                    "Connection Prohibited", displayed_addr, req.port
+                ),
             ))),
         }
     }
@@ -502,13 +550,17 @@ where
 }
 
 /// Convert an address and AddrType to a SocketAddr
-async fn addr_to_socket(addr_type: &AddrType, addr: &[u8], port: u16) -> io::Result<Vec<SocketAddr>> {
+async fn addr_to_socket(
+    addr_type: &AddrType,
+    addr: &[u8],
+    port: u16,
+) -> io::Result<Vec<SocketAddr>> {
     match addr_type {
         AddrType::V6 => {
             let new_addr = (0..8)
                 .map(|x| {
                     trace!("{} and {}", x * 2, (x * 2) + 1);
-                    (u16::from(addr[(x * 2)]) << 8) | u16::from(addr[(x * 2) + 1])
+                    (u16::from(addr[x * 2]) << 8) | u16::from(addr[(x * 2) + 1])
                 })
                 .collect::<Vec<u16>>();
 
@@ -553,7 +605,7 @@ fn pretty_print_addr(addr_type: &AddrType, addr: &[u8]) -> String {
             .join("."),
         AddrType::V6 => {
             let addr_16 = (0..8)
-                .map(|x| (u16::from(addr[(x * 2)]) << 8) | u16::from(addr[(x * 2) + 1]))
+                .map(|x| (u16::from(addr[x * 2]) << 8) | u16::from(addr[(x * 2) + 1]))
                 .collect::<Vec<u16>>();
 
             addr_16
@@ -619,7 +671,7 @@ impl SOCKSReq {
         let command = match SockCommand::from(packet[1] as usize) {
             Some(com) => Ok(com),
             None => {
-                warn!("Invalid Command");
+                warn!("Invalid Command {:?}", packet[1]);
                 stream.shutdown().await?;
                 Err(MerinoError::Socks(ResponseCode::CommandNotSupported))
             }
